@@ -84,10 +84,13 @@ def fetch_ticket_info(url: str) -> dict:
     }
 
     # ── 공연 제목 ──────────────────────────────
-    for sel in ["h2.tit_concert", ".tit_perf", "h1.tit", ".perf_tit", "h2.tit"]:
-        el = soup.select_one(sel)
-        if el:
-            info["title"] = el.get_text(strip=True)
+    for sel in [".tit", "h2.tit_concert", ".tit_perf", "h1.tit", ".perf_tit"]:
+        for el in soup.select(sel):
+            text = el.get_text(strip=True)
+            if text and len(text) > 3 and "안내" not in text and "출연" not in text:
+                info["title"] = text
+                break
+        if info["title"]:
             break
 
     # ── 날짜 / 장소 ────────────────────────────
