@@ -17,8 +17,12 @@ from datetime import datetime
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 CONCERT_URL         = os.environ.get("CONCERT_URL", "")
 PRICE_THRESHOLD     = int(os.environ.get("PRICE_THRESHOLD", "100000"))
-TARGET_ROUND        = os.environ.get("TARGET_ROUND", "").strip()   # 예: "2회차", "3회", "" = 전체
-CHECK_INTERVAL      = int(os.environ.get("CHECK_INTERVAL", "0"))   # 0 = 1회 실행, 양수 = 루프
+CHECK_INTERVAL      = int(os.environ.get("CHECK_INTERVAL", "0"))
+
+# 날짜/시간으로 회차 지정
+# 예: "2025-08-15 19:30"  또는  "8월 15일 19:30"  또는  "08/15 19:30"
+# 비워두면 전체 회차 모니터링
+TARGET_DATETIME = os.environ.get("TARGET_DATETIME", "").strip()
 
 HEADERS = {
     "User-Agent": (
@@ -29,6 +33,32 @@ HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9",
     "Referer": "https://ticket.melon.com/",
 }
+
+
+def normalize(text: str) -> str:
+    """비교를 위해 공백·특수문자 제거 후 소문자화"""
+    return re.sub(r"[\s\-\.:/]", "", text).lower()
+
+
+def datetime_matches(cell_text: str) -> bool:
+    """
+    페이지의 날짜/시간 셀 텍스트가 TARGET_DATETIME과 일치하는지 확인.
+    '2025-08-15 19:30', '8월15일', '19:30' 등 다양한 형태를 유연하게 비교.
+    """
+    if not TARGET_DATETIME:
+        return True  # 비어있으면 전체 허용
+
+    # 날짜/시간을 숫자만 추출해서 비교 (예: "20250815" "1930")
+    target_norm = normalize(TARGET_DATETIME)
+
+    # 월·일·시·분 숫자만 추출
+    target_digits = re.sub(r"[^\d]", "", target_norm)
+    cell_digits   = re.sub(r"[^\d]", "", cell_text)
+
+    # 타겟 숫자가 셀 텍스트 숫자 안에 포함되면 매칭
+    # 예: "0815" "1930" → 셀에 "20250815193000" 있으면 True
+    parts = TARGET_DATETIME.replace("-", " ").replace("/", " ").replace(":", " ").split()
+    return all(p.zfill(2) in cell_digits or p in cell_text for p in parts if p.isdigit())
 
 
 def fetch_ticket_info(url: str) -> dict:
@@ -43,14 +73,14 @@ def fetch_ticket_info(url: str) -> dict:
     soup = BeautifulSoup(resp.text, "html.parser")
 
     info = {
-        "title": "",
-        "date": "",
-        "venue": "",
-        "round": "",
-        "prices": [],
-        "round_prices": [],   # 회차 필터링된 가격
-        "status": "",
-        "url": url,
+        "title":        "",
+        "date":         "",
+        "venue":        "",
+        "target_round": "",   # 매칭된 회차 텍스트
+        "prices":       [],   # 전체 가격
+        "target_prices":[],   # 회차 필터링된 가격
+        "status":       "",
+        "url":          url,
     }
 
     # ── 공연 제목 ──────────────────────────────
@@ -68,18 +98,7 @@ def fetch_ticket_info(url: str) -> dict:
         if any(k in text for k in ["장소", "공연장"]):
             info["venue"] = text
 
-    # ── 회차 정보 추출 ─────────────────────────
-    # 멜론티켓은 회차를 "1회", "2회차", "N회차" 형태로 표기
-    round_els = soup.select(".tbl_schedule tr, .schedule_list li, .round_list li, .perf_schedule tr")
-    rounds_found = []
-    for el in round_els:
-        txt = el.get_text(" ", strip=True)
-        if re.search(r"\d+\s*회", txt):
-            rounds_found.append(txt)
-    if rounds_found:
-        info["round"] = " / ".join(rounds_found[:5])  # 최대 5개까지만
-
-    # ── 가격 추출 (전체) ───────────────────────
+    # ── 전체 가격 추출 ─────────────────────────
     price_candidates = []
     for el in soup.select(".price, .ticket_price, .tbl_price td, .price_info, .area_price"):
         txt = el.get_text(" ", strip=True)
@@ -96,20 +115,33 @@ def fetch_ticket_info(url: str) -> dict:
 
     info["prices"] = sorted(set(price_candidates))
 
-    # ── 회차 필터링 가격 ───────────────────────
-    if TARGET_ROUND:
-        # TARGET_ROUND가 포함된 블록에서만 가격 추출
-        round_prices = []
-        for el in soup.select(".tbl_schedule tr, .schedule_list li, .round_list li, .perf_schedule tr"):
-            txt = el.get_text(" ", strip=True)
-            if TARGET_ROUND in txt:
-                for n in re.findall(r"[\d,]+(?=\s*원)", txt):
+    # ── 날짜/시간 기반 회차 필터링 ────────────
+    if TARGET_DATETIME:
+        target_prices = []
+        matched_row_text = ""
+
+        # 스케줄 테이블 행 순회
+        schedule_rows = soup.select(
+            ".tbl_schedule tr, .schedule_list li, "
+            ".perf_schedule tr, .list_schedule li, "
+            "table tr"
+        )
+
+        for row in schedule_rows:
+            row_text = row.get_text(" ", strip=True)
+            if datetime_matches(row_text):
+                matched_row_text = row_text
+                for n in re.findall(r"[\d,]+(?=\s*원)", row_text):
                     val = int(n.replace(",", ""))
                     if 1_000 < val < 10_000_000:
-                        round_prices.append(val)
-        info["round_prices"] = sorted(set(round_prices)) if round_prices else info["prices"]
+                        target_prices.append(val)
+
+        info["target_round"]  = matched_row_text or TARGET_DATETIME
+        # 회차별 가격을 못 찾으면 전체 가격으로 폴백
+        info["target_prices"] = sorted(set(target_prices)) if target_prices else info["prices"]
     else:
-        info["round_prices"] = info["prices"]
+        info["target_round"]  = "전체 회차"
+        info["target_prices"] = info["prices"]
 
     # ── 예매 상태 ──────────────────────────────
     for sel in [".btn_reservation", ".btn_booking", ".state_label", ".btn_ticket"]:
@@ -131,10 +163,10 @@ def send_discord_alert(info: dict, matched_prices: list):
     now         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     matched_str = ", ".join(f"{p:,}원" for p in matched_prices)
     all_str     = ", ".join(f"{p:,}원" for p in info["prices"]) or "확인 필요"
-    round_label = f" [{TARGET_ROUND}]" if TARGET_ROUND else ""
+    round_label = f" [{TARGET_DATETIME}]" if TARGET_DATETIME else ""
 
     embed = {
-        "title": f"🎟️ [{title}]{round_label} 티켓 감지!",
+        "title": f"🎟️ {title}{round_label} 티켓 감지!",
         "description": (
             f"**{PRICE_THRESHOLD:,}원 이상** 티켓이 발견됐어요!\n\n"
             f"🔥 해당 티켓: **{matched_str}**\n"
@@ -142,12 +174,12 @@ def send_discord_alert(info: dict, matched_prices: list):
         ),
         "color": 0xFF4500,
         "fields": [
-            {"name": "🎭 공연명",    "value": title,                             "inline": False},
-            {"name": "🗓 일정",      "value": info.get("date")   or "확인 필요", "inline": True},
-            {"name": "📍 장소",      "value": info.get("venue")  or "확인 필요", "inline": True},
-            {"name": "🔢 모니터링 회차", "value": TARGET_ROUND or "전체 회차",   "inline": True},
-            {"name": "💰 전체 가격", "value": all_str,                           "inline": False},
-            {"name": "🔖 예매 상태", "value": info.get("status") or "확인 필요", "inline": True},
+            {"name": "🎭 공연명",    "value": title,                                      "inline": False},
+            {"name": "🗓 일정",      "value": info.get("date")        or "확인 필요",     "inline": True},
+            {"name": "📍 장소",      "value": info.get("venue")       or "확인 필요",     "inline": True},
+            {"name": "🕐 지정 회차", "value": TARGET_DATETIME         or "전체 회차",     "inline": True},
+            {"name": "💰 전체 가격", "value": all_str,                                    "inline": False},
+            {"name": "🔖 예매 상태", "value": info.get("status")      or "확인 필요",     "inline": True},
         ],
         "url": info["url"],
         "footer": {"text": f"멜론티켓 모니터 | {now}"},
@@ -176,14 +208,14 @@ def check_once():
         print("[ERROR] 페이지 로드 실패")
         return
 
-    prices  = info.get("round_prices", [])
+    prices  = info.get("target_prices", [])
     matched = [p for p in prices if p >= PRICE_THRESHOLD]
 
     if matched:
         print(f"🎯 조건 충족! {[f'{p:,}원' for p in matched]}")
         send_discord_alert(info, matched)
     else:
-        round_info = f" ({TARGET_ROUND})" if TARGET_ROUND else ""
+        round_info = f" ({TARGET_DATETIME})" if TARGET_DATETIME else ""
         print(f"조건 미충족{round_info} (발견된 가격: {[f'{p:,}원' for p in prices] or '없음'})")
 
 
@@ -197,7 +229,7 @@ def main():
 
     print(f"[INFO] 대상 URL    : {CONCERT_URL}")
     print(f"[INFO] 알림 조건   : {PRICE_THRESHOLD:,}원 이상")
-    print(f"[INFO] 모니터링 회차: {TARGET_ROUND or '전체'}")
+    print(f"[INFO] 지정 회차   : {TARGET_DATETIME or '전체'}")
     print(f"[INFO] 실행 모드   : {'루프 (Railway)' if CHECK_INTERVAL > 0 else '1회 실행 (GitHub Actions)'}")
     print("─" * 50)
 
